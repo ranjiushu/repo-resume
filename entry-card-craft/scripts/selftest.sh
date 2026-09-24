@@ -25,7 +25,8 @@ chk() { if [ "$2" = "$3" ]; then ok "$1（$2）"; else bad "$1：期望 $3，实
 pages_of() { python3 -c 'import re,sys;print(len(re.findall(rb"/Type\s*/Page(?![s])",open(sys.argv[1],"rb").read())))' "$1"; }
 links()    { grep -oE '\]\([^)]+\)' "$1" | sed 's/^](//; s/)$//'; }
 
-command -v typst >/dev/null 2>&1 || [ -n "${TYPST_PATH:-}" ] || [ -x "$HOME/.cache/repo-resume/typst/0.15.1/x86_64-unknown-linux-musl/typst" ] || {
+CACHED_TYPST="$(ls -1 "$HOME"/.cache/repo-resume/typst/*/*/typst 2>/dev/null | head -1)"
+command -v typst >/dev/null 2>&1 || [ -n "${TYPST_PATH:-}" ] || [ -n "$CACHED_TYPST" ] || {
   echo "跳过：本机没有 Typst（自检要真排页面）"; exit 2; }
 [ "${#DOCS[@]}" -gt 0 ] || { echo "跳过：当前目录没有可测的入口文档"; exit 2; }
 echo "被测文档：${DOCS[*]}"
@@ -101,6 +102,20 @@ chk "rc" "$rc" "0"
 chk "每个文档都有一条 http 引用" "$(printf '%s' "$out" | grep -c '!\[\](http://192.0.2.7:8123/.*-p1\.png)')" "$(ls -1 "$WORK/v"/*-p1.png | wc -l)"
 chk "引用数 = 图片数" "$(printf '%s' "$out" | grep -c '!\[\](http://')" "$(ls -1 "$WORK/v"/*-p[0-9]*.png | wc -l)"
 chk "不存在的目录被拒（rc=1）" "$(bash "$SK/serve-entry-doc.sh" --dir /nonexistent-dir --print >/dev/null 2>&1; echo $?)" "1"
+
+echo "── 转换器回归：HTML 注释不入页、粗体里的行内代码不失手"
+cat > "$WORK/conv.md" <<'MDEOF'
+# 回归
+
+- **数据写入必须走 `save*` 出口**
+<!-- 同构节:begin branch-governance -->
+正文
+<!-- 同构节:end -->
+MDEOF
+python3 "$SK/md2typst.py" "$WORK/conv.md" "$WORK/conv.typ" std
+chk "HTML 注释不进正文" "$(grep -cF '同构节' "$WORK/conv.typ")" "0"
+chk "粗体不残留裸 \\*\\*" "$(grep -cF '**' "$WORK/conv.typ")" "0"
+chk "粗体里的行内代码仍成立" "$(grep -cF '#raw("save*")' "$WORK/conv.typ")" "1"
 
 [ "$KEEP" = 1 ] || rm -rf "$WORK"
 echo

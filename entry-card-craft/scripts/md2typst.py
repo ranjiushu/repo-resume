@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """md2typst.py —— 把 print-entry-doc.sh 里那套 markdown 解析规则,原样改写成 Typst 源码输出。
-   块级覆盖：代码块 / 引用块(递归) / 表格 / 有序与无序列表 / 标题 / 段落 / 分隔线
-   行内覆盖：`code`、**bold**、[text](link)
+   块级覆盖：代码块 / 引用块(递归) / 表格 / 有序与无序列表 / 标题 / 段落 / 分隔线；
+             HTML 注释(<!-- ... -->)整块丢弃——它是给工具看的标记(如同构节标注)，不是正文。
+   行内覆盖：`code`、**bold**、[text](link)；bold 内允许嵌 `code`（如 **走 `save*` 出口**）。
    与原 md2html 的唯一差异：输出目标从 HTML 变成 Typst markup，样式改用 Typst 的
    #set / #show 规则统一声明（相当于原来那份 CSS 的等价物）。
    中文细节：中西文间隙交给 Typst 原生 cjk-latin-spacing（默认 auto，约 0.25em），
@@ -44,6 +45,9 @@ OL = re.compile(r"^\s*\d+[.)]\s+")
 HR = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$")
 FENCE = re.compile(r"^\s*```")
 HEAD = re.compile(r"^(#{1,6})\s+(.*)$")
+# HTML 注释（`<!-- 同构节:begin x -->`）是给工具看的标记，不是正文：整块丢弃，不排进页面。
+COMMENT_START = re.compile(r"^\s*<!--")
+COMMENT_END = re.compile(r"-->\s*$")
 
 def esc(s):
     # Typst 的特殊字符：# * _ $ [ ] < > @ ` \ 都要转义
@@ -57,24 +61,35 @@ def tstr(s):
     （Python 的 %r 会给出单引号，直接把排版打断）。"""
     return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
 
+# 行内三种记号。加粗内容允许含 `*`（如 **走 `save*` 出口**），故用非贪婪 .+? 而非 [^*]+；
+# 匹配到加粗后递归解析其内容，行内代码才能嵌在粗体里而不被整行放弃。
+INLINE_CODE = re.compile(r"`([^`]+)`")
+INLINE_BOLD = re.compile(r"\*\*(.+?)\*\*", re.S)
+INLINE_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+INLINE_ORDER = ((INLINE_CODE, "code"), (INLINE_BOLD, "bold"), (INLINE_LINK, "link"))
+
 def inline(s):
     # 先处理行内代码/加粗/链接，再对剩余纯文本转义，避免语法字符被二次转义
-    parts = []
-    pattern = re.compile(r"(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\))")
-    pos = 0
-    for m in pattern.finditer(s):
+    parts, pos, n = [], 0, len(s)
+    while pos < n:
+        hit = None
+        for pattern, kind in INLINE_ORDER:
+            m = pattern.search(s, pos)
+            if m is not None and (hit is None or m.start() < hit[0].start()):
+                hit = (m, kind)
+        if hit is None:
+            parts.append(esc(s[pos:]))
+            break
+        m, kind = hit
         if m.start() > pos:
             parts.append(esc(s[pos:m.start()]))
-        chunk = m.group(0)
-        if chunk.startswith("`"):
-            parts.append("#raw(%s)" % tstr(chunk[1:-1]))
-        elif chunk.startswith("**"):
-            parts.append("*%s*" % esc(chunk[2:-2]))  # Typst 里 *x* 就是加粗
+        if kind == "code":
+            parts.append("#raw(%s)" % tstr(m.group(1)))
+        elif kind == "bold":
+            parts.append("*%s*" % inline(m.group(1)))  # Typst 里 *x* 就是加粗
         else:
-            mm = re.match(r"\[([^\]]+)\]\(([^)]+)\)", chunk)
-            parts.append("#link(%s)[%s]" % (tstr(mm.group(2)), esc(mm.group(1))))
+            parts.append("#link(%s)[%s]" % (tstr(m.group(2)), inline(m.group(1))))
         pos = m.end()
-    parts.append(esc(s[pos:]))
     return "".join(parts)
 
 def strip_q(line):
@@ -100,7 +115,9 @@ def take_table(lines, i):
     out = ["#table(", "  columns: %d," % ncol, "  stroke: 0.5pt + rgb(\"#cfcfcf\"),"]
     out.append("  fill: (x, y) => if y == 0 { rgb(\"#f2f2f2\") } else if calc.even(y) { rgb(\"#fafafa\") } else { white },")
     hdr = ", ".join("[*%s*]" % inline(c) for c in head)
-    out.append("  %s," % hdr)
+    # 用 table.header() 而不是普通数据行：表头带「与首行同页」语义，
+    # 否则表格在页底断开时会把表头单独留在上一页（页面终审可见的孤悬）。
+    out.append("  table.header(%s)," % hdr)
     for r in rows:
         out.append("  " + ", ".join("[%s]" % inline(c) for c in r) + ",")
     out.append(")")
@@ -110,6 +127,13 @@ def render(lines, depth=0):
     out, i, n = [], 0, len(lines)
     while i < n:
         raw = lines[i]
+        if COMMENT_START.match(raw):
+            if not COMMENT_END.search(raw):
+                i += 1
+                while i < n and not COMMENT_END.search(lines[i]):
+                    i += 1
+            i += 1
+            continue
         if FENCE.match(raw):
             i += 1
             buf = []
@@ -144,7 +168,8 @@ def render(lines, depth=0):
                 i += 1
                 while (i < n and lines[i].strip() and not pat.match(lines[i])
                        and not FENCE.match(lines[i]) and not QUOTE.match(lines[i])
-                       and not HEAD.match(lines[i]) and "|" not in lines[i]):
+                       and not HEAD.match(lines[i]) and not COMMENT_START.match(lines[i])
+                       and "|" not in lines[i]):
                     item = smart_join([item, lines[i].strip()])
                     i += 1
                 out.append("%s %s" % (marker, inline(item)))
@@ -167,7 +192,8 @@ def render(lines, depth=0):
         while (i < n and lines[i].strip() and not FENCE.match(lines[i])
                and not QUOTE.match(lines[i]) and not HEAD.match(lines[i])
                and not UL.match(lines[i]) and not OL.match(lines[i])
-               and not HR.match(lines[i]) and "|" not in lines[i]):
+               and not HR.match(lines[i]) and not COMMENT_START.match(lines[i])
+               and "|" not in lines[i]):
             buf.append(lines[i].strip())
             i += 1
         out.append(inline(smart_join(buf)))
@@ -186,7 +212,7 @@ PREAMBLE = """\
   #block(below: 18pt, above: 36pt)[#it.body]
   #line(length: 100%, stroke: 0.5pt + rgb("#c9c9c9"))
 ]
-#show heading.where(level: 2): it => block(above: 27pt, below: 14pt)[
+#show heading.where(level: 2): it => block(above: 27pt, below: 14pt, sticky: true)[
   #set text(font: ("Noto Sans CJK SC", "Helvetica"), size: 15pt, weight: "bold", tracking: 0.02em)
   #it.body
 ]
@@ -212,7 +238,7 @@ PREAMBLE_FIT = """\
   #block(below: 16pt, above: 32pt)[#it.body]
   #line(length: 100%, stroke: 0.5pt + rgb("#c9c9c9"))
 ]
-#show heading.where(level: 2): it => block(above: 24pt, below: 13pt)[
+#show heading.where(level: 2): it => block(above: 24pt, below: 13pt, sticky: true)[
   #set text(font: ("Noto Sans CJK SC", "Helvetica"), size: 14pt, weight: "bold", tracking: 0.02em)
   #it.body
 ]
