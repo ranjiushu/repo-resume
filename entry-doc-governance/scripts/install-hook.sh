@@ -83,6 +83,17 @@ if [ "$MODE" = check ]; then
   done
   if [ ! -f "$HOOK" ] || ! grep -qF "$MARK_BEGIN" "$HOOK"; then
     echo "[install] ❌ $HOOK 里没有本守卫的调用块" >&2; rc=1
+  else
+    # 死守卫检查：块出现在顶层 exit 之后 → 钩子根本走不到它（静默哑门禁）
+    _reach="$(awk -v mb="$MARK_BEGIN" '
+      index($0, mb) { print (dead ? "dead" : "ok"); found=1; exit }
+      /^exit([[:space:]]|$)/ { dead=1 }
+      END { if (!found) print "missing" }
+    ' "$HOOK")"
+    if [ "$_reach" != "ok" ]; then
+      echo "[install] ❌ 守卫块不可达（在顶层 exit 之后；实测：$_reach）—— 形同没装，拒绝放行" >&2
+      rc=1
+    fi
   fi
   for _m in "${LEGACY_MARKS[@]}"; do
     if [ -f "$HOOK" ] && grep -qF "${_m%%|*}" "$HOOK"; then
@@ -183,15 +194,28 @@ for _m in "${LEGACY_MARKS[@]}"; do
 done
 
 python3 - "$HOOK" "$MARK_BEGIN" "$MARK_END" "$BLOCK" <<'PYEOF'
-import io, sys
+import io, os, re, sys
 hook, mb, me, block = sys.argv[1:5]
 block = block.rstrip("\n") + "\n"
-src = io.open(hook, encoding="utf-8").read() if __import__("os").path.exists(hook) else ""
+src = io.open(hook, encoding="utf-8").read() if os.path.exists(hook) else ""
 i, j = src.find(mb), src.find(me)
 if i != -1 and j != -1:
-    new = src[:i] + block + src[j + len(me):].lstrip("\n")
+    # 先摘掉旧块，再按同一套规则放回：老版本装错的块（追加在 exit 之后的死守卫）
+    # 靠这一步自动归位，不需要人工 --uninstall 再装。
+    src = src[:i] + src[j + len(me):]
+lines = src.rstrip("\n").split("\n") if src.strip() else []
+# 顶层 `exit`（含 `exit 0`）之后的代码永不执行：守卫若排在它后面就是死守卫——
+# 看着装好了、实际一次都不跑（哑门禁比没门禁更危险）。故插到**最后一个**顶层 exit 之前。
+cut = None
+for n, line in enumerate(lines):
+    if re.match(r"^exit(\s+\S+)?\s*$", line):
+        cut = n
+if cut is None:
+    new = ("\n".join(lines) + "\n\n" + block) if lines else block
 else:
-    new = src.rstrip("\n") + "\n\n" + block if src.strip() else block
+    head = "\n".join(lines[:cut]).rstrip("\n")
+    tail = "\n".join(lines[cut:]).strip("\n")
+    new = (head + "\n\n" if head else "") + block + (tail + "\n" if tail else "")
 io.open(hook, "w", encoding="utf-8").write(new)
 PYEOF
 chmod +x "$HOOK"
